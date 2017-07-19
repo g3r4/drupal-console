@@ -1,14 +1,26 @@
 <?php
 
-namespace Drupal\Console;
+namespace Drupal\Console\Core;
 
-use Doctrine\Common\Annotations\AnnotationRegistry;
-use Symfony\Component\Console\Input\InputInterface;
-use Symfony\Component\Console\Output\OutputInterface;
+use Drupal\Console\Core\Utils\TranslatorManagerInterface;
 use Symfony\Component\DependencyInjection\ContainerInterface;
-use Drupal\Console\Annotations\DrupalCommandAnnotationReader;
-use Drupal\Console\Utils\AnnotationValidator;
-use Drupal\Console\Core\Application as BaseApplication;
+use Symfony\Component\EventDispatcher\EventDispatcher;
+use Symfony\Component\Console\Output\OutputInterface;
+use Symfony\Component\Console\Input\InputInterface;
+use Symfony\Component\Console\Input\InputOption;
+use Symfony\Component\Console\Application as BaseApplication;
+use Drupal\Console\Core\EventSubscriber\DefaultValueEventListener;
+use Drupal\Console\Core\EventSubscriber\ShowGenerateChainListener;
+use Drupal\Console\Core\EventSubscriber\ShowTipsListener;
+use Drupal\Console\Core\EventSubscriber\ShowWelcomeMessageListener;
+use Drupal\Console\Core\EventSubscriber\ValidateExecutionListener;
+use Drupal\Console\Core\EventSubscriber\ShowGeneratedFilesListener;
+use Drupal\Console\Core\EventSubscriber\ShowGenerateInlineListener;
+use Drupal\Console\Core\EventSubscriber\CallCommandListener;
+use Drupal\Console\Core\Utils\ConfigurationManager;
+use Drupal\Console\Core\Style\DrupalStyle;
+use Drupal\Console\Core\Utils\ChainDiscovery;
+use Drupal\Console\Core\Command\Chain\ChainCustomCommand;
 
 /**
  * Class Application
@@ -18,18 +30,56 @@ use Drupal\Console\Core\Application as BaseApplication;
 class Application extends BaseApplication
 {
     /**
-     * @var string
+     * @var ContainerInterface
      */
-    const NAME = 'Drupal Console';
+    protected $container;
 
     /**
      * @var string
      */
-    const VERSION = '1.0.0-rc17';
+    protected $commandName;
 
-    public function __construct(ContainerInterface $container)
+    /**
+     * ConsoleApplication constructor.
+     *
+     * @param ContainerInterface $container
+     * @param string             $name
+     * @param string             $version
+     */
+    public function __construct(
+        ContainerInterface$container,
+        $name,
+        $version
+    ) {
+        $this->container = $container;
+        parent::__construct($name, $version);
+        $this->addOptions();
+    }
+
+    /**
+     * @return TranslatorManagerInterface
+     */
+    public function getTranslator()
     {
-        parent::__construct($container, $this::NAME, $this::VERSION);
+        if ($this->container) {
+            return $this->container->get('console.translator_manager');
+        }
+
+        return null;
+    }
+
+    /**
+     * @param $key string
+     *
+     * @return string
+     */
+    public function trans($key)
+    {
+        if ($this->getTranslator()) {
+            return $this->getTranslator()->trans($key);
+        }
+
+        return null;
     }
 
     /**
@@ -37,341 +87,379 @@ class Application extends BaseApplication
      */
     public function doRun(InputInterface $input, OutputInterface $output)
     {
-        $this->registerGenerators();
-        $this->registerCommands();
-        $clear = $this->container->get('console.configuration_manager')
-            ->getConfiguration()
-            ->get('application.clear')?:false;
-        if ($clear === true || $clear === 'true') {
-            $output->write(sprintf("\033\143"));
+        $io = new DrupalStyle($input, $output);
+        $messages = [];
+        if ($commandName = $this->getCommandName($input)) {
+            $this->commandName = $commandName;
+        }
+        $this->registerEvents();
+        $this->registerExtendCommands();
+
+        /**
+         * @var ConfigurationManager $configurationManager
+         */
+        $configurationManager = $this->container
+            ->get('console.configuration_manager');
+
+        $config = $configurationManager->getConfiguration()
+            ->get('application.extras.config')?:'true';
+        if ($config === 'true') {
+            $this->registerCommandsFromAutoWireConfiguration();
         }
 
-        $exitCode = parent::doRun($input, $output);
-        return $exitCode;
-    }
-
-    private function registerGenerators()
-    {
-        if ($this->container->hasParameter('drupal.generators')) {
-            $consoleGenerators = $this->container->getParameter(
-                'drupal.generators'
-            );
-        } else {
-            $consoleGenerators = array_keys(
-                $this->container->findTaggedServiceIds('drupal.generator')
-            );
+        $chains = $configurationManager->getConfiguration()
+            ->get('application.extras.chains')?:'true';
+        if ($chains === 'true') {
+            $this->registerChainCommands();
         }
 
-        foreach ($consoleGenerators as $name) {
-            if (!$this->container->has($name)) {
-                continue;
-            }
 
-            try {
-                $generator = $this->container->get($name);
-            } catch (\Exception $e) {
-                echo $name . ' - ' . $e->getMessage() . PHP_EOL;
+        if ($commandName && !$this->has($commandName)) {
+            $config = $configurationManager->getConfiguration();
+            $mappings = $config
+                ->get('application.commands.mappings');
 
-                continue;
-            }
-
-            if (!$generator) {
-                continue;
-            }
-
-            if (method_exists($generator, 'setRenderer')) {
-                $generator->setRenderer(
-                    $this->container->get('console.renderer')
+            if (array_key_exists($commandName, $mappings)) {
+                $commandNameMap = $mappings[$commandName];
+                $messages['warning'][] = sprintf(
+                    $this->trans('application.errors.renamed-command'),
+                    $commandName,
+                    $commandNameMap
                 );
-            }
-
-            if (method_exists($generator, 'setFileQueue')) {
-                $generator->setFileQueue(
-                    $this->container->get('console.file_queue')
+                $this->add(
+                    $this->find($commandNameMap)->setAliases([$commandName])
                 );
-            }
-        }
-    }
-
-    private function registerCommands()
-    {
-        if ($this->container->hasParameter('drupal.commands')) {
-            $consoleCommands = $this->container->getParameter(
-                'drupal.commands'
-            );
-        } else {
-            $consoleCommands = array_keys(
-                $this->container->findTaggedServiceIds('drupal.command')
-            );
-            $this->container->setParameter(
-                'console.warning',
-                'application.site.errors.settings'
-            );
-        }
-
-        $serviceDefinitions = [];
-        $annotationValidator = null;
-        $annotationCommandReader = null;
-        if ($this->container->hasParameter('console.service_definitions')) {
-            $serviceDefinitions = $this->container
-                ->getParameter('console.service_definitions');
-
-            /**
-             * @var DrupalCommandAnnotationReader $annotationCommandReader
-             */
-            $annotationCommandReader = $this->container
-                ->get('console.annotation_command_reader');
-
-            /**
-             * @var AnnotationValidator $annotationValidator
-             */
-            $annotationValidator = $this->container
-                ->get('console.annotation_validator');
-        }
-
-        $aliases = $this->container->get('console.configuration_manager')
-            ->getConfiguration()
-            ->get('application.commands.aliases')?:[];
-
-        foreach ($consoleCommands as $name) {
-            AnnotationRegistry::reset();
-            AnnotationRegistry::registerLoader(
-                [
-                    $this->container->get('class_loader'),
-                    "loadClass"
-                ]
-            );
-
-            if (!$this->container->has($name)) {
-                continue;
-            }
-
-            if ($annotationValidator && $annotationCommandReader) {
-                if (!$serviceDefinition = $serviceDefinitions[$name]) {
-                    continue;
-                }
-
-                $annotation = $annotationCommandReader
-                    ->readAnnotation($serviceDefinition->getClass());
-                if ($annotation) {
-                    $this->container->get('console.translator_manager')
-                        ->addResourceTranslationsByExtension(
-                            $annotation['extension'],
-                            $annotation['extensionType']
-                        );
-                }
-
-                if (!$annotationValidator->isValidCommand($serviceDefinition->getClass())) {
-                    continue;
-                }
-            }
-
-            try {
-                $command = $this->container->get($name);
-            } catch (\Exception $e) {
-                echo $name . ' - ' . $e->getMessage() . PHP_EOL;
-
-                continue;
-            }
-
-            if (!$command) {
-                continue;
-            }
-
-            if (method_exists($command, 'setTranslator')) {
-                $command->setTranslator(
-                    $this->container->get('console.translator_manager')
+            } else {
+                $io->error(
+                    sprintf(
+                        $this->trans('application.errors.invalid-command'),
+                        $this->commandName
+                    )
                 );
+
+                return 1;
             }
-
-            if (method_exists($command, 'setContainer')) {
-                $command->setContainer(
-                    $this->container->get('service_container')
-                );
-            }
-
-            if (array_key_exists($command->getName(), $aliases)) {
-                $commandAliases = $aliases[$command->getName()];
-                if (!is_array($commandAliases)) {
-                    $commandAliases = [$commandAliases];
-                }
-                $command->setAliases($commandAliases);
-            }
-
-            $this->add($command);
-        }
-    }
-
-    public function getData()
-    {
-        $singleCommands = [
-            'about',
-            'chain',
-            'check',
-            'exec',
-            'help',
-            'init',
-            'list',
-            'shell',
-            'server'
-        ];
-
-        $languages = $this->container->get('console.configuration_manager')
-            ->getConfiguration()
-            ->get('application.languages');
-
-        $data = [];
-        foreach ($singleCommands as $singleCommand) {
-            $data['commands']['misc'][] = $this->commandData($singleCommand);
         }
 
-        $namespaces = array_filter(
-            $this->getNamespaces(), function ($item) {
-                return (strpos($item, ':')<=0);
-            }
+        $code = parent::doRun(
+            $input,
+            $output
         );
-        sort($namespaces);
-        array_unshift($namespaces, 'misc');
 
-        foreach ($namespaces as $namespace) {
-            $commands = $this->all($namespace);
-            usort(
-                $commands, function ($cmd1, $cmd2) {
-                    return strcmp($cmd1->getName(), $cmd2->getName());
-                }
+        if ($this->commandName != 'init' && $configurationManager->getMissingConfigurationFiles(
+        )
+        ) {
+            $io->warning(
+                $this->trans('application.site.errors.missing-config-file')
             );
+            $io->listing($configurationManager->getMissingConfigurationFiles());
+            $io->commentBlock(
+                $this->trans(
+                    'application.site.errors.missing-config-file-command'
+                )
+            );
+        }
 
-            foreach ($commands as $command) {
-                if (method_exists($command, 'getModule')) {
-                    if ($command->getModule() == 'Console') {
-                        $data['commands'][$namespace][] = $this->commandData(
-                            $command->getName()
-                        );
+        if ($this->getCommandName(
+            $input
+        ) == 'list' && $this->container->hasParameter('console.warning')
+        ) {
+            $io->warning(
+                $this->trans($this->container->getParameter('console.warning'))
+            );
+        }
+
+        foreach ($messages as $type => $message) {
+            $io->$type($message);
+        }
+
+        return $code;
+    }
+
+    /**
+     * registerEvents
+     */
+    private function registerEvents()
+    {
+        $dispatcher = new EventDispatcher();
+        /* @todo Register listeners as services */
+        $dispatcher->addSubscriber(
+            new ValidateExecutionListener(
+                $this->container->get('console.translator_manager'),
+                $this->container->get('console.configuration_manager')
+            )
+        );
+        $dispatcher->addSubscriber(
+            new ShowWelcomeMessageListener(
+                $this->container->get('console.translator_manager')
+            )
+        );
+        $dispatcher->addSubscriber(
+            new DefaultValueEventListener(
+                $this->container->get('console.configuration_manager')
+            )
+        );
+        $dispatcher->addSubscriber(
+            new ShowTipsListener(
+                $this->container->get('console.translator_manager')
+            )
+        );
+        $dispatcher->addSubscriber(
+            new CallCommandListener(
+                $this->container->get('console.chain_queue')
+            )
+        );
+        $dispatcher->addSubscriber(
+            new ShowGeneratedFilesListener(
+                $this->container->get('console.file_queue'),
+                $this->container->get('console.show_file')
+            )
+        );
+        $dispatcher->addSubscriber(
+            new ShowGenerateInlineListener(
+                $this->container->get('console.translator_manager')
+            )
+        );
+        $dispatcher->addSubscriber(
+            new ShowGenerateChainListener(
+                $this->container->get('console.translator_manager')
+            )
+        );
+
+        $this->setDispatcher($dispatcher);
+    }
+
+    /**
+     * addOptions
+     */
+    private function addOptions()
+    {
+        $this->getDefinition()->addOption(
+            new InputOption(
+                '--env',
+                '-e',
+                InputOption::VALUE_OPTIONAL,
+                $this->trans('application.options.env'), 'prod'
+            )
+        );
+        $this->getDefinition()->addOption(
+            new InputOption(
+                '--root',
+                null,
+                InputOption::VALUE_OPTIONAL,
+                $this->trans('application.options.root')
+            )
+        );
+        $this->getDefinition()->addOption(
+            new InputOption(
+                '--debug',
+                null,
+                InputOption::VALUE_NONE,
+                $this->trans('application.options.debug')
+            )
+        );
+        $this->getDefinition()->addOption(
+            new InputOption(
+                '--learning',
+                null,
+                InputOption::VALUE_NONE,
+                $this->trans('application.options.learning')
+            )
+        );
+        $this->getDefinition()->addOption(
+            new InputOption(
+                '--generate-chain',
+                '-c',
+                InputOption::VALUE_NONE,
+                $this->trans('application.options.generate-chain')
+            )
+        );
+        $this->getDefinition()->addOption(
+            new InputOption(
+                '--generate-inline',
+                '-i',
+                InputOption::VALUE_NONE,
+                $this->trans('application.options.generate-inline')
+            )
+        );
+        $this->getDefinition()->addOption(
+            new InputOption(
+                '--generate-doc',
+                '-d',
+                InputOption::VALUE_NONE,
+                $this->trans('application.options.generate-doc')
+            )
+        );
+        $this->getDefinition()->addOption(
+            new InputOption(
+                '--target',
+                '-t',
+                InputOption::VALUE_OPTIONAL,
+                $this->trans('application.options.target')
+            )
+        );
+        $this->getDefinition()->addOption(
+            new InputOption(
+                '--uri',
+                '-l',
+                InputOption::VALUE_REQUIRED,
+                $this->trans('application.options.uri')
+            )
+        );
+        $this->getDefinition()->addOption(
+            new InputOption(
+                '--yes',
+                '-y',
+                InputOption::VALUE_NONE,
+                $this->trans('application.options.yes')
+            )
+        );
+    }
+
+    /**
+     * registerExtendCommands
+     */
+    private function registerExtendCommands()
+    {
+        $this->container->get('console.configuration_manager')
+            ->loadExtendConfiguration();
+    }
+
+    /**
+     * registerCommandsFromAutoWireConfiguration
+     */
+    private function registerCommandsFromAutoWireConfiguration()
+    {
+        $configuration = $this->container->get('console.configuration_manager')
+            ->getConfiguration();
+
+        $autoWireForcedCommands = $configuration
+            ->get('application.autowire.commands.forced');
+
+        if (!is_array($autoWireForcedCommands)) {
+            return;
+        }
+
+        foreach ($autoWireForcedCommands as $autoWireForcedCommand) {
+            try {
+                if (!$autoWireForcedCommand['class']) {
+                    continue;
+                }
+
+                $reflectionClass = new \ReflectionClass(
+                    $autoWireForcedCommand['class']
+                );
+
+                $arguments = [];
+                if (array_key_exists('arguments', $autoWireForcedCommand)) {
+                    foreach ($autoWireForcedCommand['arguments'] as $argument) {
+                        $argument = substr($argument, 1);
+                        $arguments[] = $this->container->get($argument);
                     }
-                } else {
-                    $data['commands'][$namespace][] = $this->commandData(
-                        $command->getName()
+                }
+
+                $command = $reflectionClass->newInstanceArgs($arguments);
+
+                if (method_exists($command, 'setTranslator')) {
+                    $command->setTranslator(
+                        $this->container->get('console.translator_manager')
                     );
                 }
+                if (method_exists($command, 'setContainer')) {
+                    $command->setContainer(
+                        $this->container->get('service_container')
+                    );
+                }
+
+                $this->add($command);
+            } catch (\Exception $e) {
+                echo $e->getMessage() . PHP_EOL;
+                continue;
             }
         }
 
-        $input = $this->getDefinition();
-        $options = [];
-        foreach ($input->getOptions() as $option) {
-            $options[] = [
-                'name' => $option->getName(),
-                'description' => $this->trans('application.options.'.$option->getName())
-            ];
-        }
-        $arguments = [];
-        foreach ($input->getArguments() as $argument) {
-            $arguments[] = [
-                'name' => $argument->getName(),
-                'description' => $this->trans('application.arguments.'.$argument->getName())
-            ];
-        }
+        $autoWireNameCommand = $configuration->get(
+            sprintf(
+                'application.autowire.commands.name.%s',
+                $this->commandName
+            )
+        );
 
-        $data['application'] = [
-            'namespaces' => $namespaces,
-            'options' => $options,
-            'arguments' => $arguments,
-            'languages' => $languages,
-            'messages' => [
-                'title' =>  $this->trans('commands.generate.doc.gitbook.messages.title'),
-                'note' =>  $this->trans('commands.generate.doc.gitbook.messages.note'),
-                'note_description' =>  $this->trans('commands.generate.doc.gitbook.messages.note-description'),
-                'command' =>  $this->trans('commands.generate.doc.gitbook.messages.command'),
-                'options' => $this->trans('commands.generate.doc.gitbook.messages.options'),
-                'option' => $this->trans('commands.generate.doc.gitbook.messages.option'),
-                'details' => $this->trans('commands.generate.doc.gitbook.messages.details'),
-                'arguments' => $this->trans('commands.generate.doc.gitbook.messages.arguments'),
-                'argument' => $this->trans('commands.generate.doc.gitbook.messages.argument'),
-                'examples' => $this->trans('commands.generate.doc.gitbook.messages.examples')
-            ],
-            'examples' => []
-        ];
+        if ($autoWireNameCommand) {
+            try {
+                $arguments = [];
+                if (array_key_exists('arguments', $autoWireNameCommand)) {
+                    foreach ($autoWireNameCommand['arguments'] as $argument) {
+                        $argument = substr($argument, 1);
+                        $arguments[] = $this->container->get($argument);
+                    }
+                }
 
-        return $data;
-    }
+                $reflectionClass = new \ReflectionClass(
+                    $autoWireNameCommand['class']
+                );
+                $command = $reflectionClass->newInstanceArgs($arguments);
 
-    private function commandData($commandName)
-    {
-        if (!$this->has($commandName)) {
-            return [];
-        }
+                if (method_exists($command, 'setTranslator')) {
+                    $command->setTranslator(
+                        $this->container->get('console.translator_manager')
+                    );
+                }
+                if (method_exists($command, 'setContainer')) {
+                    $command->setContainer(
+                        $this->container->get('service_container')
+                    );
+                }
 
-        $command = $this->find($commandName);
-
-        $input = $command->getDefinition();
-        $options = [];
-        foreach ($input->getOptions() as $option) {
-            $options[$option->getName()] = [
-                'name' => $option->getName(),
-                'description' => $this->trans($option->getDescription()),
-            ];
-        }
-
-        $arguments = [];
-        foreach ($input->getArguments() as $argument) {
-            $arguments[$argument->getName()] = [
-                'name' => $argument->getName(),
-                'description' => $this->trans($argument->getDescription()),
-            ];
-        }
-
-        $commandKey = str_replace(':', '.', $command->getName());
-
-        $examples = [];
-        for ($i = 0; $i < 5; $i++) {
-            $description = sprintf(
-                'commands.%s.examples.%s.description',
-                $commandKey,
-                $i
-            );
-            $execution = sprintf(
-                'commands.%s.examples.%s.execution',
-                $commandKey,
-                $i
-            );
-
-            if ($description != $this->trans($description)) {
-                $examples[] = [
-                    'description' => $this->trans($description),
-                    'execution' => $this->trans($execution)
-                ];
-            } else {
-                break;
+                $this->add($command);
+            } catch (\Exception $e) {
+                echo $e->getMessage() . PHP_EOL;
             }
         }
-
-        $data = [
-            'name' => $command->getName(),
-            'description' => $command->getDescription(),
-            'options' => $options,
-            'arguments' => $arguments,
-            'examples' => $examples,
-            'aliases' => $command->getAliases(),
-            'key' => $commandKey,
-            'dashed' => str_replace(':', '-', $command->getName()),
-            'messages' => [
-                'usage' =>  $this->trans('commands.generate.doc.gitbook.messages.usage'),
-                'options' => $this->trans('commands.generate.doc.gitbook.messages.options'),
-                'option' => $this->trans('commands.generate.doc.gitbook.messages.option'),
-                'details' => $this->trans('commands.generate.doc.gitbook.messages.details'),
-                'arguments' => $this->trans('commands.generate.doc.gitbook.messages.arguments'),
-                'argument' => $this->trans('commands.generate.doc.gitbook.messages.argument'),
-                'examples' => $this->trans('commands.generate.doc.gitbook.messages.examples')
-            ],
-        ];
-
-        return $data;
     }
 
-    public function setContainer($container)
+    /**
+     * registerChainCommands
+     */
+    public function registerChainCommands()
     {
-        $this->container = $container;
-        $this->registerGenerators();
-        $this->registerCommands();
+        /**
+         * @var ChainDiscovery $chainDiscovery
+         */
+        $chainDiscovery = $this->container->get('console.chain_discovery');
+        $chainCommands = $chainDiscovery->getChainCommands();
+
+        foreach ($chainCommands as $name => $chainCommand) {
+            try {
+                $file = $chainCommand['file'];
+                $description = $chainCommand['description'];
+                $placeHolders = $chainCommand['placeholders'];
+                $command = new ChainCustomCommand(
+                    $name,
+                    $description,
+                    $placeHolders,
+                    $file
+                );
+                $this->add($command);
+            } catch (\Exception $e) {
+                echo $e->getMessage() . PHP_EOL;
+            }
+        }
+    }
+
+    /**
+     * Finds a command by name or alias.
+     *
+     * @param string $name A command name or a command alias
+     *
+     * @return mixed A Command instance
+     *
+     * Override parent find method to avoid name collisions with automatically
+     * generated command abbreviations.
+     * Command name validation was previously done at doRun method.
+     */
+    public function find($name)
+    {
+        return $this->get($name);
     }
 }

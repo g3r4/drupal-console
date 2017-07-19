@@ -2,90 +2,246 @@
 
 /**
  * @file
- * Contains \Drupal\Console\Utils\TranslatorManager.
+ * Contains \Drupal\Console\Core\Utils\TranslatorManager.
  */
 
-namespace Drupal\Console\Utils;
+namespace Drupal\Console\Core\Utils;
 
-use Drupal\Console\Core\Utils\TranslatorManager as TranslatorManagerBase;
-use Symfony\Component\Yaml\Exception\ParseException;
+use Symfony\Component\Translation\Translator;
+use Symfony\Component\Translation\Loader\YamlFileLoader;
+use Symfony\Component\Translation\Loader\ArrayLoader;
 use Symfony\Component\Finder\Finder;
+use Symfony\Component\Yaml\Parser;
+use Symfony\Component\Filesystem\Filesystem;
+use Symfony\Component\Yaml\Exception\ParseException;
 
 /**
  * Class TranslatorManager
  *
- * @package Drupal\Console\Utils
+ * @package Drupal\Console\Core\Utils
  */
-class TranslatorManager extends TranslatorManagerBase
+class TranslatorManager implements TranslatorManagerInterface
 {
     /**
-     * @param $extensionPath
+     * @var string
      */
-    private function addResourceTranslationsByExtensionPath($extensionPath)
+    protected $language;
+
+    /**
+     * @var Translator
+     */
+    protected $translator;
+
+    /**
+     * @var Parser
+     */
+    protected $parser;
+
+    /**
+     * @var Filesystem
+     */
+    protected $filesystem;
+
+    /**
+     * @var string
+     */
+    protected $coreLanguageRoot;
+
+    /**
+     * Translator constructor.
+     */
+    public function __construct()
     {
-        $languageDirectory = sprintf(
-            '%s/console/translations/%s',
-            $extensionPath,
+        $this->parser = new Parser();
+        $this->filesystem = new Filesystem();
+    }
+
+    /**
+     * @param $resource
+     * @param string   $name
+     */
+    private function addResource($resource, $name = 'yaml')
+    {
+        $this->translator->addResource(
+            $name,
+            $resource,
             $this->language
         );
+    }
 
-        if (!is_dir($languageDirectory)) {
+    /**
+     * @param $loader
+     * @param string $name
+     */
+    private function addLoader($loader, $name = 'yaml')
+    {
+        $this->translator->addLoader(
+            $name,
+            $loader
+        );
+    }
+
+    /**
+     * @param $language
+     * @param $directoryRoot
+     *
+     * @return array
+     */
+    private function buildCoreLanguageDirectory(
+        $language,
+        $directoryRoot
+    ) {
+        $coreLanguageDirectory =
+            $directoryRoot .
+            sprintf(
+                DRUPAL_CONSOLE_LANGUAGE,
+                $language
+            );
+
+        if (!is_dir($coreLanguageDirectory)) {
+            return $this->buildCoreLanguageDirectory('en', $directoryRoot);
+        }
+
+        if (!$this->coreLanguageRoot) {
+            $this->coreLanguageRoot = $directoryRoot;
+        }
+
+        return [$language, $coreLanguageDirectory];
+    }
+
+    /**
+     * {@inheritdoc}
+     */
+    public function loadCoreLanguage($language, $directoryRoot)
+    {
+        $coreLanguageDirectory = $this->buildCoreLanguageDirectory(
+            $language,
+            $directoryRoot
+        );
+
+        $this->loadResource(
+            $coreLanguageDirectory[0],
+            $coreLanguageDirectory[1]
+        );
+
+        return $this;
+    }
+
+    /**
+     * {@inheritdoc}
+     */
+    public function changeCoreLanguage($language)
+    {
+        return $this->loadCoreLanguage($language, $this->coreLanguageRoot);
+    }
+
+    /**
+     * {@inheritdoc}
+     */
+    public function loadResource($language, $directoryRoot)
+    {
+        if (!is_dir($directoryRoot)) {
             return;
         }
+
+        $this->language = $language;
+        $this->translator = new Translator($this->language);
+        $this->addLoader(new ArrayLoader(), 'array');
+        $this->addLoader(new YamlFileLoader(), 'yaml');
+
+        /* @TODO fallback to en */
         $finder = new Finder();
         $finder->files()
             ->name('*.yml')
-            ->in($languageDirectory);
+            ->in($directoryRoot);
+
         foreach ($finder as $file) {
-            $resource = $languageDirectory . '/' . $file->getBasename();
+            $resource = $directoryRoot.'/'.$file->getBasename();
             $filename = $file->getBasename('.yml');
-            $key = 'commands.' . $filename;
+
+            // Handle application file different than commands
+            if ($filename == 'application') {
+                try {
+                    $this->loadTranslationByFile($resource, 'application');
+                } catch (ParseException $e) {
+                    echo 'application.yml'.' '.$e->getMessage();
+                }
+
+                continue;
+            }
+            $key = 'commands.'.$filename;
             try {
                 $this->loadTranslationByFile($resource, $key);
             } catch (ParseException $e) {
-                echo $key . '.yml ' . $e->getMessage();
+                echo $key.'.yml '.$e->getMessage();
             }
         }
+
+        return;
     }
 
     /**
-     * @param $module
+     * Load yml translation where filename is part of translation key.
+     *
+     * @param $resource
+     * @param $resourceKey
      */
-    private function addResourceTranslationsByModule($module)
+    protected function loadTranslationByFile($resource, $resourceKey = null)
     {
-        if (!\Drupal::moduleHandler()->moduleExists($module)) {
-            return;
+        $resourceParsed = $this->parser->parse(file_get_contents($resource));
+
+        if ($resourceKey) {
+            $parents = explode('.', $resourceKey);
+            $resourceArray = [];
+            $this->setResourceArray($parents, $resourceArray, $resourceParsed);
+            $resourceParsed = $resourceArray;
         }
-        $extensionPath = \Drupal::moduleHandler()->getModule($module)->getPath();
-        $this->addResourceTranslationsByExtensionPath(
-            $extensionPath
-        );
+
+        $this->addResource($resourceParsed, 'array');
     }
 
     /**
-     * @param $theme
+     * @param $parents
+     * @param $parentsArray
+     * @param $resource
+     *
+     * @return mixed
      */
-    private function addResourceTranslationsByTheme($theme)
+    private function setResourceArray($parents, &$parentsArray, $resource)
     {
-        $extensionPath = \Drupal::service('theme_handler')->getTheme($theme)->getPath();
-        $this->addResourceTranslationsByExtensionPath(
-            $extensionPath
-        );
+        $ref = &$parentsArray;
+        foreach ($parents as $parent) {
+            $ref[$parent] = [];
+            $previous = &$ref;
+            $ref = &$ref[$parent];
+        }
+
+        $previous[$parent] = $resource;
+
+        return $parentsArray;
     }
 
     /**
-     * @param $extension
-     * @param $type
+     * {@inheritdoc}
      */
-    public function addResourceTranslationsByExtension($extension, $type)
+    public function getTranslator()
     {
-        if ($type == 'module') {
-            $this->addResourceTranslationsByModule($extension);
-            return;
-        }
-        if ($type == 'theme') {
-            $this->addResourceTranslationsByTheme($extension);
-            return;
-        }
+        return $this->translator;
+    }
+
+    /**
+     * {@inheritdoc}
+     */
+    public function getLanguage()
+    {
+        return $this->language;
+    }
+
+    /**
+     * {@inheritdoc}
+     */
+    public function trans($key)
+    {
+        return $this->translator->trans($key);
     }
 }
